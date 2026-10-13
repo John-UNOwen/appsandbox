@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <wchar.h>
 
 #pragma comment(lib, "user32.lib")
 
@@ -69,6 +70,55 @@ static void switch_to_input_desktop(void)
     }
 }
 
+/* ---- Target display ---- */
+
+/* Host frame coordinates are relative to the App Sandbox virtual display,
+ * which is not always the primary monitor (the Hyper-V synthetic display can
+ * still be active beside it). Return its desktop rect, else the primary's. */
+static RECT target_display_rect(void)
+{
+    static RECT cached;
+    static ULONGLONG checked;
+    ULONGLONG now = GetTickCount64();
+    DISPLAY_DEVICEW dd;
+    DEVMODEW dm;
+    DWORD i;
+
+    if (checked && now - checked < 1000)
+        return cached;
+    checked = now;
+
+    SetRect(&cached, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    if (IsRectEmpty(&cached))
+        SetRect(&cached, 0, 0, 1920, 1080);
+
+    ZeroMemory(&dd, sizeof(dd));
+    dd.cb = sizeof(dd);
+    for (i = 0; EnumDisplayDevicesW(NULL, i, &dd, 0); i++, dd.cb = sizeof(dd)) {
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ||
+            !wcsstr(dd.DeviceString, L"App Sandbox Virtual Display"))
+            continue;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0) &&
+            dm.dmPelsWidth && dm.dmPelsHeight) {
+            SetRect(&cached, dm.dmPosition.x, dm.dmPosition.y,
+                    dm.dmPosition.x + (LONG)dm.dmPelsWidth,
+                    dm.dmPosition.y + (LONG)dm.dmPelsHeight);
+            break;
+        }
+    }
+    return cached;
+}
+
+/* Normalized MOUSEEVENTF_VIRTUALDESK coordinate for desktop pixel p, aimed a
+ * quarter pixel in so truncating or rounding denormalization both land on it. */
+static LONG to_virtual_desk(LONG p, int origin, int size)
+{
+    if (size <= 0) return 0;
+    return (LONG)(((LONGLONG)(p - origin) * 4 + 1) * 65536 / ((LONGLONG)size * 4));
+}
+
 /* ---- Input injection ---- */
 
 static void inject_input(const InputPacket *pkt)
@@ -80,14 +130,17 @@ static void inject_input(const InputPacket *pkt)
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
-        int screen_w = GetSystemMetrics(SM_CXSCREEN);
-        int screen_h = GetSystemMetrics(SM_CYSCREEN);
-        if (screen_w <= 0) screen_w = 1920;
-        if (screen_h <= 0) screen_h = 1080;
+        RECT r = target_display_rect();
+        UINT32 max_x = (UINT32)(r.right - r.left - 1);
+        UINT32 max_y = (UINT32)(r.bottom - r.top - 1);
+        LONG x = r.left + (LONG)(pkt->param1 < max_x ? pkt->param1 : max_x);
+        LONG y = r.top + (LONG)(pkt->param2 < max_y ? pkt->param2 : max_y);
         inp.type = INPUT_MOUSE;
-        inp.mi.dx = (LONG)(pkt->param1 * 65535 / (UINT32)(screen_w - 1));
-        inp.mi.dy = (LONG)(pkt->param2 * 65535 / (UINT32)(screen_h - 1));
-        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        inp.mi.dx = to_virtual_desk(x, GetSystemMetrics(SM_XVIRTUALSCREEN),
+                                    GetSystemMetrics(SM_CXVIRTUALSCREEN));
+        inp.mi.dy = to_virtual_desk(y, GetSystemMetrics(SM_YVIRTUALSCREEN),
+                                    GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         result = SendInput(1, &inp, sizeof(INPUT));
         if (result == 0)
             input_log("SendInput(MOUSE_MOVE) failed: %lu", GetLastError());
@@ -297,8 +350,11 @@ static void handle_conn(AsbConn *c)
             if (mouse_version != INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) continue;
             switch_to_input_desktop();
             if (GetPhysicalCursorPos(&point)) {
-                reply.param1 = (UINT32)point.x;
-                reply.param2 = (UINT32)point.y;
+                /* Frame-relative, like MOUSE_MOVE. Off the target display the
+                   values fall outside the frame and the host ignores them. */
+                RECT r = target_display_rect();
+                reply.param1 = (UINT32)(point.x - r.left);
+                reply.param2 = (UINT32)(point.y - r.top);
             }
             if (send_full(c, &reply, (int)sizeof(reply)) != (int)sizeof(reply))
                 break;
