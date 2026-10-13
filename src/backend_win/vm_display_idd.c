@@ -231,6 +231,16 @@ struct VmDisplayIdd {
     InputPacket    mouse_reply;
     int            mouse_reply_size;
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
+    BOOL           move_pending;
+    UINT32         move_pending_x;
+    UINT32         move_pending_y;
+    UINT32         move_sent_x;
+    UINT32         move_sent_y;
+    ULONGLONG      move_sent_tick;
+    UINT32         move_drops;
+    UINT32         move_skipped;
+    ULONGLONG      cursor_query_tick;
+    BOOL           cursor_diag;
     BOOL           tracking;        /* TrackMouseEvent active */
 
     /* Keyboard hotkey handling */
@@ -541,6 +551,57 @@ static BOOL idd_clip_mouse(VmDisplayIdd *d)
     return ClipCursor(&rc);
 }
 
+/* Move packets are the only thing that positions the guest cursor and a button packet
+   carries no coordinates, so a move dropped by the non blocking send leaves the next
+   click landing where the guest cursor last was. Keep only the newest target, send at
+   most one move per present tick, and retry a dropped move instead of losing it. */
+static void idd_flush_mouse_move(VmDisplayIdd *d)
+{
+    BOOL ok;
+    if (!d->move_pending) return;
+    AcquireSRWLockExclusive(&d->input_lock);
+    ok = send_input_locked(d, INPUT_MOUSE_MOVE, d->move_pending_x, d->move_pending_y, 0);
+    ReleaseSRWLockExclusive(&d->input_lock);
+    d->move_sent_tick = GetTickCount64();
+    if (ok) {
+        d->move_pending = FALSE;
+        d->move_sent_x = d->move_pending_x;
+        d->move_sent_y = d->move_pending_y;
+    } else {
+        d->move_drops++;
+        if ((d->move_drops % 20u) == 1u)
+            ui_log(L"INPUTTRACE move dropped total=%u target=%u,%u",
+                   d->move_drops, d->move_pending_x, d->move_pending_y);
+    }
+}
+
+static void idd_queue_mouse_move(VmDisplayIdd *d, UINT32 vx, UINT32 vy)
+{
+    d->move_pending = TRUE;
+    d->move_pending_x = vx;
+    d->move_pending_y = vy;
+    if (GetTickCount64() - d->move_sent_tick >= PRESENT_MS)
+        idd_flush_mouse_move(d);
+}
+
+/* Ask the guest where its cursor actually is. This is the only way to tell a mapping
+   error from a queue that drains slower than the host produces moves. */
+static void idd_start_cursor_query(VmDisplayIdd *d)
+{
+    if (d->stop || !d->frame_connected || d->input_socket == INVALID_SOCKET) return;
+    if (++d->mouse_sync_id == 0) ++d->mouse_sync_id;
+    GetCursorPos(&d->mouse_sync_origin);
+    d->mouse_sync_deadline = GetTickCount64() + 700;
+    d->mouse_reply_size = 0;
+    d->cursor_diag = TRUE;
+    AcquireSRWLockExclusive(&d->input_lock);
+    d->mouse_sync_socket = d->input_socket;
+    d->mouse_sync_pending = send_input_locked(d, INPUT_MOUSE_POSITION_QUERY,
+                                              d->mouse_sync_id, 0, 0);
+    ReleaseSRWLockExclusive(&d->input_lock);
+    d->cursor_query_tick = GetTickCount64() + 700;
+}
+
 static void idd_cancel_mouse_sync(VmDisplayIdd *d)
 {
     POINT point;
@@ -548,8 +609,7 @@ static void idd_cancel_mouse_sync(VmDisplayIdd *d)
     d->mouse_sync_pending = FALSE;
     if (GetForegroundWindow() == d->hwnd && GetCursorPos(&point) &&
         WindowFromPoint(point) == d->render_hwnd)
-        SetCursor(!d->cursor_visible ? NULL :
-                  d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
+        SetCursor(d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
 }
 
 static void idd_update_relative_mouse(VmDisplayIdd *d)
@@ -561,8 +621,12 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
                    !d->input_menu_active && !d->input_sizing &&
                    GetForegroundWindow() == d->hwnd && !IsIconic(d->hwnd) &&
                    GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd;
-    BOOL capture = active && !d->cursor_visible;
+    /* Relative capture moves the guest cursor by deltas only. With no cursor shape
+       received there is nothing to aim with, no anchor, and the deltas are unscaled
+       window pixels, so the guest cursor drifts from the picture. Map absolute. */
+    BOOL capture = FALSE;
     BOOL sync_absolute = FALSE;
+    BOOL anchor = FALSE;
     if (!active || capture) idd_cancel_mouse_sync(d);
     AcquireSRWLockExclusive(&g_mouse_capture_lock);
     if (capture == d->relative_mouse &&
@@ -579,6 +643,7 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
                 d->relative_mouse = TRUE;
                 d->mouse_in = TRUE;
                 d->raw_absolute_valid = FALSE;
+                anchor = TRUE;
                 SetCursor(NULL);
             } else {
                 mouse.dwFlags = RIDEV_REMOVE;
@@ -598,6 +663,20 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
         d->raw_absolute_valid = FALSE;
     }
     ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+
+    /* Relative mode only ever moves the guest cursor by deltas, so on entry the
+       guest cursor is wherever it last was. Anchor it to the pointer position the
+       user is actually looking at, otherwise every click is off by that gap. */
+    if (anchor && capture && d->render_hwnd && d->frame_width && d->frame_height) {
+        POINT anchor_pt = pt;
+        UINT anchor_x, anchor_y;
+        ScreenToClient(d->render_hwnd, &anchor_pt);
+        window_to_vm_coords(d->render_hwnd, anchor_pt.x, anchor_pt.y,
+                            d->frame_width, d->frame_height, &anchor_x, &anchor_y);
+        send_input(d, INPUT_MOUSE_MOVE, anchor_x, anchor_y, 0);
+        idd_log(d, L"Relative mode anchored at frame %u,%u", anchor_x, anchor_y);
+    }
+
     if (sync_absolute && d->frame_width && d->frame_height) {
         if (d->mouse_version == INPUT_MOUSE_VERSION) {
             if (++d->mouse_sync_id == 0) ++d->mouse_sync_id;
@@ -919,6 +998,8 @@ static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply)
 {
     POINT point;
     UINT vx, vy;
+    if (reply)
+        ui_log(L"INPUTTRACE resume warp guest=%u,%u", reply->param1, reply->param2);
     if (d->stop || !d->frame_connected || !d->input_focused ||
         d->input_menu_active || d->input_sizing || d->relative_mouse ||
         !d->cursor_visible || !d->frame_width || !d->frame_height ||
@@ -995,8 +1076,15 @@ static void idd_poll_mouse_position(VmDisplayIdd *d)
     ReleaseSRWLockExclusive(&d->input_lock);
     if (disconnected)
         idd_cancel_mouse_sync(d);
-    else if (received)
-        idd_resume_absolute_mouse(d, &reply);
+    else if (received) {
+        if (d->cursor_diag) {
+            ui_log(L"INPUTTRACE guest cursor=%u,%u last_sent=%u,%u",
+                   reply.param1, reply.param2, d->move_sent_x, d->move_sent_y);
+            idd_cancel_mouse_sync(d);
+        } else {
+            idd_resume_absolute_mouse(d, &reply);
+        }
+    }
     else if (GetTickCount64() >= d->mouse_sync_deadline)
         idd_resume_absolute_mouse(d, NULL);
 }
@@ -2529,6 +2617,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
+            else if (!d->relative_mouse && GetTickCount64() >= d->cursor_query_tick)
+                idd_start_cursor_query(d);
+            if (d->move_pending) idd_flush_mouse_move(d);
             if (d->frame_dirty)
                 d3d_render_frame(d);
         }
@@ -2656,6 +2747,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     d->raw_absolute_valid = FALSE;
                 }
                 if (dx || dy) {
+                    /* Raw deltas are host window pixels, the guest cursor moves in
+                       frame pixels. Scale them or the pointer drifts away from the
+                       picture whenever the window is not drawn 1 to 1. */
+                    RECT scale_rc;
+                    float sc_x, sc_y, sc_w, sc_h;
+                    GetClientRect(d->render_hwnd, &scale_rc);
+                    compute_letterbox((UINT)scale_rc.right, (UINT)scale_rc.bottom,
+                                      d->frame_width, d->frame_height,
+                                      &sc_x, &sc_y, &sc_w, &sc_h);
+                    if (sc_w > 0.0f && sc_h > 0.0f) {
+                        dx = (LONG)((float)dx * (float)d->frame_width / sc_w);
+                        dy = (LONG)((float)dy * (float)d->frame_height / sc_h);
+                    }
                     send_input(d, INPUT_MOUSE_RELATIVE, (UINT32)dx, (UINT32)dy, 0);
                 }
             }
@@ -2677,12 +2781,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!d->relative_mouse && !d->cursor_visible)
                 idd_update_relative_mouse(d);
 
-            if (!d->relative_mouse && !d->mouse_sync_pending && d->frame_width && d->frame_height) {
+            if (!d->relative_mouse && d->frame_width && d->frame_height) {
                 UINT vx, vy;
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
                                     d->frame_width, d->frame_height, &vx, &vy);
-                send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
+                idd_queue_mouse_move(d, vx, vy);
+            } else {
+                d->move_skipped++;
+                if ((d->move_skipped % 50u) == 1u)
+                    ui_log(L"INPUTTRACE move skipped total=%u sync=%d rel=%d frame=%ux%u",
+                           d->move_skipped, (int)d->mouse_sync_pending, (int)d->relative_mouse,
+                           d->frame_width, d->frame_height);
             }
         }
         return 0;
@@ -2697,9 +2807,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && (!d->cursor_visible || d->mouse_sync_pending))
+            if (d && d->cursor_visible && d->mouse_sync_pending)
                 SetCursor(NULL);
-            else if (d && d->guest_cursor)
+            else if (d && d->cursor_visible && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -2711,6 +2821,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:
         if (d && d->mouse_in) {
             if (d->render_hwnd) SetCapture(d->render_hwnd);
+            idd_flush_mouse_move(d);
+            {
+                RECT crc, wrc;
+                GetClientRect(d->render_hwnd, &crc);
+                GetClientRect(hwnd, &wrc);
+                ui_log(L"INPUTTRACE click client=%d,%d frame_sent=%u,%u render=%dx%d top=%dx%d drops=%u skipped=%u",
+                       (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
+                       d->move_sent_x, d->move_sent_y,
+                       crc.right, crc.bottom, wrc.right, wrc.bottom,
+                       d->move_drops, d->move_skipped);
+            }
             send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
             d->mouse_buttons |= 1u << INPUT_BTN_LEFT;
         }
@@ -2725,6 +2846,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_RBUTTONDOWN:
         if (d && d->mouse_in) {
+            idd_flush_mouse_move(d);
             send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
             d->mouse_buttons |= 1u << INPUT_BTN_RIGHT;
         }
@@ -2738,6 +2860,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_MBUTTONDOWN:
         if (d && d->mouse_in) {
+            idd_flush_mouse_move(d);
             send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
             d->mouse_buttons |= 1u << INPUT_BTN_MIDDLE;
         }
