@@ -225,6 +225,7 @@ static BOOL check_gpu_error43(void)
 }
 
 static void disable_hyperv_video(AsbConn *notify_sock);
+static void report_displays(AsbConn *notify, const wchar_t *args);
 
 
 /* Disable and re-enable vrd.inf display devices.
@@ -650,9 +651,11 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
 
     /* If files were copied and vrd.inf has error 43, restart GPU + IDD devices
        and re-disable Hyper-V Video adapter. */
+    BOOL device_cycle_ran = FALSE;
     if (total_files > 0 && check_gpu_error43()) {
         agent_log("GPU drivers copied and error 43 detected - attempting device restart.");
         cycle_gpu_devices(state->notify_sock, TRUE);
+        device_cycle_ran = TRUE;
 
         /* TODO: re-enable once IDD display is stable
         Sleep(2000);
@@ -663,6 +666,13 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     } else {
         agent_log("All GPU driver files already present (pre-staged) - no copy or restart needed.");
     }
+
+    /* The extra display target appears once the paravirtualized GPU gets its display
+       driver, which is true on every boot after the first, so this runs whether or not
+       anything was copied. No device restart involved: drop every display target except
+       the AppSandbox virtual display, then report the resulting layout to the host. */
+    Sleep(device_cycle_ran ? 2000 : 500);
+    report_displays(state->notify_sock, L"fix");
 
     if (failed_shares == 0 && (gl_dir[0] || native_dir[0] || gpu_prefers_system_opengl()))
         gl_provision(gl_dir, native_dir);
@@ -1627,7 +1637,7 @@ static void ensure_hyperv_video_disabled(AsbConn *notify)
 /* Spawn appsandbox-displays.exe in the interactive session and capture its
    stdout.  The helper prints "N,WxH,WxH,..." and exits.  We use the same
    token-dup + SetTokenInformation pattern as spawn_input_in_session(). */
-static void report_displays(AsbConn *notify)
+static void report_displays(AsbConn *notify, const wchar_t *args)
 {
     HANDLE cur_token = NULL, dup_token = NULL;
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
@@ -1635,6 +1645,7 @@ static void report_displays(AsbConn *notify)
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t exe_path[MAX_PATH];
+    wchar_t cmd_line[MAX_PATH * 2];
     wchar_t *slash;
     DWORD session_id;
     char output[512];
@@ -1657,6 +1668,13 @@ static void report_displays(AsbConn *notify)
     slash = wcsrchr(exe_path, L'\\');
     if (slash) *(slash + 1) = L'\0';
     wcscat_s(exe_path, MAX_PATH, L"appsandbox-displays.exe");
+
+    /* args is NULL for a plain report, or "fix" to make the AppSandbox display the
+       only active monitor before the report is printed. */
+    if (args != NULL && args[0] != L'\0')
+        swprintf_s(cmd_line, MAX_PATH * 2, L"\"%s\" %s", exe_path, args);
+    else
+        swprintf_s(cmd_line, MAX_PATH * 2, L"\"%s\"", exe_path);
 
     if (GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
         agent_log("report_displays: %ls not found.", exe_path);
@@ -1709,7 +1727,7 @@ static void report_displays(AsbConn *notify)
     si.hStdInput = NULL;
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessAsUserW(dup_token, exe_path, NULL, NULL, NULL,
+    if (!CreateProcessAsUserW(dup_token, exe_path, cmd_line, NULL, NULL,
                                TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         agent_log("report_displays: CreateProcessAsUserW failed (%lu).", GetLastError());
         CloseHandle(dup_token); CloseHandle(hReadPipe); CloseHandle(hWritePipe);
@@ -1720,9 +1738,10 @@ static void report_displays(AsbConn *notify)
     CloseHandle(hWritePipe);  /* Close write end so ReadFile sees EOF */
     hWritePipe = NULL;
 
-    /* Wait for process (max 2s) then read output.
-       Timeout is normal at early boot before the desktop is ready. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
+    /* Wait for process (max 8s) then read output.
+       The helper prints one summary line at the end, so terminating it early reports
+       an empty layout. Timeout is still normal at early boot before the desktop is ready. */
+    if (WaitForSingleObject(pi.hProcess, 8000) == WAIT_TIMEOUT) {
         agent_log("report_displays: helper timed out (desktop may not be ready).");
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 1000);
@@ -1790,6 +1809,11 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
     agent_log("idd_connect: respawning clipboard reader in session %lu.", new_console);
     if (new_console != 0xFFFFFFFF)
         spawn_clipboard_reader_in_session(new_console);
+
+    /* Make the streamed surface the only display, then report the layout. Absolute input
+       is resolved against the primary monitor, so an extra 1024x768 target sitting in
+       front of it offsets every coordinate the host sends. */
+    report_displays(client, L"fix");
 
     send_reply(client, tag, "ok");
 }
